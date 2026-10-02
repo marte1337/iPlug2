@@ -76,6 +76,8 @@ tresult PLUGIN_API IPlugVST3::setActive(TBool state)
 {
   TRACE
 
+  // Latency is already published before restartComponent. Reactivation is
+  // supported, but is not an acknowledgement or a prerequisite for adoption.
   OnActivate((bool) state);
   return SingleComponentEffect::setActive(state);
 }
@@ -241,12 +243,12 @@ void IPlugVST3::SendParameterValueFromUI(int paramIdx, double normalisedValue)
   IPlugAPIBase::SendParameterValueFromUI(paramIdx, normalisedValue);
 }
 
-void IPlugVST3::SetLatency(int latency)
+void IPlugVST3::NotifyLatencyChange()
 {
-  // N.B. set the latency even if the handler is not yet set
-  
-  IPlugProcessor::SetLatency(latency);
-
+  // Control thread, after the audio-owned tap has settled and published.
+  // Query-first hosts (including REAPER) must see this new value immediately.
+  // ServiceLatencyUpdates pins it until this notification returns. Neither
+  // the return code nor a reactivation callback proves sample-timed host PDC.
   if (componentHandler)
   {
     FUnknownPtr<IComponentHandler> handler(componentHandler);

@@ -68,7 +68,7 @@ public:
   void SendParameterValueFromUI(int paramIdx, double normalisedValue) override;
 
   // IPlugProcessor
-  void SetLatency(int samples) override;
+  void NotifyLatencyChange() override;
   
   // AudioEffect
   Steinberg::tresult PLUGIN_API initialize(FUnknown* context) override;

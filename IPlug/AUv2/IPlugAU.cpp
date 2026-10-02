@@ -1229,9 +1229,8 @@ OSStatus IPlugAU::SetProperty(AudioUnitPropertyID propID, AudioUnitScope scope, 
       const bool bypassed = *((UInt32*) pData) != 0;
       SetBypassed(bypassed);
       
-      // TODO: should the following be called here?
-      OnActivate(!bypassed);
-      OnReset();
+      // A bypass property write does not exclude rendering. Do not reset or
+      // pretend it is a host activation lifecycle (local latency safety repair).
       return noErr;
     }
     NO_OP(kAudioUnitProperty_LastRenderError);           // 22,
@@ -2004,11 +2003,10 @@ void IPlugAU::InformListeners(AudioUnitPropertyID propID, AudioUnitScope scope)
   }
 }
 
-void IPlugAU::SetLatency(int samples)
+void IPlugAU::NotifyLatencyChange()
 {
   TRACE
   InformListeners(kAudioUnitProperty_Latency, kAudioUnitScope_Global);
-  IPlugProcessor::SetLatency(samples);
 }
 
 bool IPlugAU::SendMidiMsg(const IMidiMsg& msg)

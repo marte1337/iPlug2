@@ -74,7 +74,7 @@ public:
   bool SendMidiMsg(const IMidiMsg& msg) override;
   bool SendMidiMsgs(WDL_TypedBuf<IMidiMsg>& msgs) override;
   bool SendSysEx(const ISysEx& msg) override;
-  void SetLatency(int samples) override;
+  void NotifyLatencyChange() override;
 
 //IPlugAU
   void OutputSysexFromEditor();
@@ -315,5 +315,4 @@ public:
 END_IPLUG_NAMESPACE
 
 #endif
-
 

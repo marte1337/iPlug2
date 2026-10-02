@@ -26,6 +26,7 @@
 #include "IPlugStructs.h"
 #include "IPlugUtilities.h"
 #include "NChanDelay.h"
+#include "LatencyState.h"
 
 /**
  * @file
@@ -104,13 +105,13 @@ public:
   int GetBlockSize() const { return mBlockSize; }
 
   /** @return Plugin latency (in samples) */
-  int GetLatency() const { return mLatency; }
+  int GetLatency() const { return LatencyState::Samples(mLatencyState.Reported()); }
 
   /** @return The tail size in samples (useful for reverberation plug-ins, that may need to decay after the transport stops or an audio item ends) */
   int GetTailSize() { return mTailSize; }
 
   /** @return \c true if the plugin is currently bypassed */
-  bool GetBypassed() const { return mBypassed; }
+  bool GetBypassed() const { return mBypassed.load(std::memory_order_relaxed); }
 
   /** @return \c true if the plugin is currently rendering off-line */
   bool GetRenderingOffline() const { return mRenderingOffline; };
@@ -229,10 +230,18 @@ public:
    * @param zeroBased If \c true the index in the format string will be zero based */
   void SetChannelLabel(ERoute direction, int idx, const char* formatStr, bool zeroBased = false);
 
-  /** Call this if the latency of your plug-in changes after initialization (perhaps from OnReset() )
-   * This may not be supported by the host. The method is virtual because it's overridden in API classes.
+  /** Queue a latency request within the capacity reserved by PrepareLatency().
+   * Local APP/AU/VST3 repair: this does not notify the host or resize buffers.
+   * ServiceLatencyUpdates() must run on the control thread. Prefer RequestLatency()
+   * when the caller needs an explicit out-of-capacity result.
    @param latency Latency in samples */
   virtual void SetLatency(int latency);
+
+  // Local dynamic-latency repair. Prepare only in the constructor or a genuine
+  // inactive lifecycle. Request is realtime-safe; Service is control-thread only.
+  void PrepareLatency(int maximumSamples);
+  bool RequestLatency(int samples, std::uint32_t configurationTag = 0) noexcept;
+  void ServiceLatencyUpdates();
 
   /** Call this method if you need to update the tail size at runtime, for example if the decay time of your reverb effect changes
    * Some apis have special interpretations of certain numbers. For VST3 set to 0xffffffff for infinite tail, or 0 for none (default)
@@ -254,6 +263,11 @@ public:
   static int ParseChannelIOStr(const char* IOStr, WDL_PtrList<IOConfig>& channelIOList, int& totalNInChans, int& totalNOutChans, int& totalNInBuses, int& totalNOutBuses);
 
 protected:
+  virtual void OnLatencyRequest(LatencyState::Word state) { mLatencyState.Permit(state); }
+  virtual void NotifyLatencyChange() {}
+  virtual void OnLatencyPrepareBlock(int) {}
+  // Optional latency-bearing input stage maintenance while fully bypassed.
+  virtual void OnLatencyBypassBlock(sample**, int) {}
 #pragma mark - Methods called by the API class - you do not call these methods in your plug-in class
   void SetChannelConnections(ERoute direction, int idx, int n, bool connected);
   void InitLatencyDelay();
@@ -270,12 +284,13 @@ protected:
   void ZeroScratchBuffers();
   void SetSampleRate(double sampleRate) { mSampleRate = sampleRate; }
   void SetBlockSize(int blockSize);
-  void SetBypassed(bool bypassed) { mBypassed = bypassed; }
+  void SetBypassed(bool bypassed) { mBypassed.store(bypassed, std::memory_order_relaxed); }
   void SetTimeInfo(const ITimeInfo& timeInfo) { mTimeInfo = timeInfo; }
   void SetRenderingOffline(bool renderingOffline) { mRenderingOffline = renderingOffline; }
   const WDL_String& GetChannelLabel(ERoute direction, int idx) { return mChannelData[direction].Get(idx)->mLabel; }
 
 private:
+  friend struct IPlugLatencyTestAccess;
   /** See EIPlugPluginTypes */
   EIPlugPluginType mPlugType;
   /** \c true if the plug-in accepts MIDI input */
@@ -285,7 +300,15 @@ private:
   /** \c true if the plug-in supports MIDI Polyphonic Expression */
   bool mDoesMPE;
   /** Plug-in latency (in samples) */
-  int mLatency;
+  LatencyState mLatencyState;
+  LatencyState::Word mLatencyControlTarget;
+  int mLatencyCapacity = 0;
+  void BeginLatencyBlock(int nFrames);
+  void RenderLatencyBuffers(int nFrames, bool bypass);
+  std::vector<sample> mBypassScratch;
+  std::vector<sample*> mBypassPointers;
+  double mBypassMix = 0., mBypassGoal = 0., mBypassStep = 0.;
+  unsigned mBypassRemaining = 0;
   /** Current sample rate (in Hz) */
   double mSampleRate = DEFAULT_SAMPLE_RATE;
   /** Current block size (in samples) */
@@ -293,7 +316,8 @@ private:
   /** Current tail size (in samples) */
   int mTailSize = 0;
   /** \c true if the plug-in is bypassed */
-  bool mBypassed = false;
+  std::atomic<bool> mBypassed{false};
+  static_assert(std::atomic<bool>::is_always_lock_free, "bypass handoff must be lock free");
   /** \c true if the plug-in is rendering off-line*/
   bool mRenderingOffline = false;
   /** A list of IOConfig structures populated by ParseChannelIOStr in the IPlugProcessor constructor */

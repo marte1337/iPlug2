@@ -26,7 +26,9 @@ IPlugProcessor::IPlugProcessor(const Config& config, EAPI plugAPI)
 , mDoesMIDIIn(config.plugDoesMidiIn)
 , mDoesMIDIOut(config.plugDoesMidiOut)
 , mDoesMPE(config.plugDoesMPE)
-, mLatency(config.latency)
+, mLatencyState(config.latency)
+, mLatencyControlTarget(LatencyState::Pack(config.latency))
+, mLatencyCapacity(config.latency)
 {
   int totalNInBuses, totalNOutBuses;
   int totalNInChans, totalNOutChans;
@@ -271,10 +273,57 @@ void IPlugProcessor::SetChannelLabel(ERoute direction, int idx, const char* form
 
 void IPlugProcessor::SetLatency(int samples)
 {
-  mLatency = samples;
+  RequestLatency(samples);
+}
 
-  if (mLatencyDelay)
-    mLatencyDelay->SetDelayTime(mLatency);
+void IPlugProcessor::PrepareLatency(int maximumSamples)
+{
+  assert(maximumSamples >= GetLatency());
+  mLatencyCapacity = maximumSamples;
+  if (!mLatencyDelay) InitLatencyDelay();
+  else mLatencyDelay->Prepare(mLatencyCapacity);
+  if (mLatencyDelay) mLatencyDelay->SetDelayTime(GetLatency());
+}
+
+bool IPlugProcessor::RequestLatency(int samples, std::uint32_t configurationTag) noexcept
+{
+  if (samples < 0 || samples > mLatencyCapacity) return false;
+  mLatencyState.Request(samples, configurationTag);
+  return true;
+}
+
+void IPlugProcessor::ServiceLatencyUpdates()
+{
+  // Audio publication is pinned until notification returns. VST3/AU hosts can
+  // synchronously query precisely the state being announced. Never called RT.
+  const auto reported = mLatencyState.Reported();
+  const auto acknowledged = mLatencyState.Acknowledged();
+  if (reported != acknowledged)
+  {
+    if (LatencyState::Samples(reported) != LatencyState::Samples(acknowledged))
+      NotifyLatencyChange();
+    mLatencyState.Acknowledge(reported);
+  }
+  const auto requested = mLatencyState.Requested();
+  if (requested != mLatencyControlTarget)
+  {
+    mLatencyControlTarget = requested;
+    OnLatencyRequest(requested);
+  }
+}
+
+void IPlugProcessor::BeginLatencyBlock(int nFrames)
+{
+  OnLatencyPrepareBlock(nFrames); // Includes bypass: DSP staging only publishes.
+  // Both fades are audio-owned. Do not adopt while the delay cannot follow.
+  if (mLatencyDelay && mLatencyDelay->Remaining()) return;
+  const unsigned fade = static_cast<unsigned>(std::max(1., std::round(GetSampleRate() * .010)));
+  if (mLatencyState.BeginBlock(fade) && mLatencyDelay)
+  {
+    const bool accepted = mLatencyDelay->SetDelayTime(LatencyState::Samples(mLatencyState.AudioTarget()), fade);
+    assert(accepted); // Capacity is validated at request time; readiness above.
+    (void) accepted;
+  }
 }
 
 //static
@@ -441,9 +490,10 @@ void IPlugProcessor::SetChannelConnections(ERoute direction, int idx, int n, boo
 
 void IPlugProcessor::InitLatencyDelay()
 {
-  if (MaxNChannels(ERoute::kInput))
+  if (MaxNChannels(ERoute::kInput) && !mLatencyDelay)
   {
     mLatencyDelay = std::unique_ptr<NChanDelayLine<PLUG_SAMPLE_DST>>(new NChanDelayLine<PLUG_SAMPLE_DST>(MaxNChannels(ERoute::kInput), MaxNChannels(ERoute::kOutput)));
+    mLatencyDelay->Prepare(mLatencyCapacity);
     mLatencyDelay->SetDelayTime(GetLatency());
   }
 }
@@ -492,10 +542,7 @@ void IPlugProcessor::AttachBuffers(ERoute direction, int idx, int n, PLUG_SAMPLE
 
 void IPlugProcessor::PassThroughBuffers(PLUG_SAMPLE_DST type, int nFrames)
 {
-  if (mLatency && mLatencyDelay)
-    mLatencyDelay->ProcessBlock(mScratchData[ERoute::kInput].Get(), mScratchData[ERoute::kOutput].Get(), nFrames);
-  else
-    IPlugProcessor::ProcessBlock(mScratchData[ERoute::kInput].Get(), mScratchData[ERoute::kOutput].Get(), nFrames);
+  RenderLatencyBuffers(nFrames, true);
 }
 
 void IPlugProcessor::PassThroughBuffers(PLUG_SAMPLE_SRC type, int nFrames)
@@ -518,7 +565,43 @@ void IPlugProcessor::PassThroughBuffers(PLUG_SAMPLE_SRC type, int nFrames)
 
 void IPlugProcessor::ProcessBuffers(PLUG_SAMPLE_DST type, int nFrames)
 {
-  ProcessBlock(mScratchData[ERoute::kInput].Get(), mScratchData[ERoute::kOutput].Get(), nFrames);
+  RenderLatencyBuffers(nFrames, false);
+}
+
+void IPlugProcessor::RenderLatencyBuffers(int nFrames, bool bypass)
+{
+  BeginLatencyBlock(nFrames);
+  const double goal = bypass ? 1. : 0.;
+  if (goal != mBypassGoal)
+  {
+    mBypassGoal = goal;
+    mBypassRemaining = static_cast<unsigned>(std::max(1., std::round(.010 * GetSampleRate())));
+    mBypassStep = (goal - mBypassMix) / mBypassRemaining;
+  }
+  auto** inputs = mScratchData[ERoute::kInput].Get();
+  auto** outputs = mScratchData[ERoute::kOutput].Get();
+  // Capture dry history before in-place DSP. Storage only changes in SetBlockSize.
+  if (mLatencyDelay)
+    mLatencyDelay->ProcessBlock(inputs, mBypassPointers.data(), nFrames);
+  else
+    IPlugProcessor::ProcessBlock(inputs, mBypassPointers.data(), nFrames);
+  if (mBypassMix != 1. || mBypassRemaining)
+    ProcessBlock(inputs, outputs, nFrames);
+  else
+    OnLatencyBypassBlock(inputs, nFrames);
+  const int channels = NOutChansConnected();
+  for (int i = 0; i < nFrames; ++i)
+  {
+    for (int c = 0; c < channels; ++c)
+    {
+      if (mBypassMix == 1.) outputs[c][i] = mBypassPointers[c][i];
+      else if (mBypassMix != 0.)
+        outputs[c][i] = (1.-mBypassMix)*outputs[c][i] + mBypassMix*mBypassPointers[c][i];
+    }
+    if (mBypassRemaining && --mBypassRemaining == 0) mBypassMix = mBypassGoal;
+    else if (mBypassRemaining) mBypassMix += mBypassStep;
+  }
+  mLatencyState.Advance(static_cast<unsigned>(nFrames));
 }
 
 void IPlugProcessor::ProcessBuffers(PLUG_SAMPLE_SRC type, int nFrames)
@@ -581,6 +664,11 @@ void IPlugProcessor::SetBlockSize(int blockSize)
   if (blockSize != mBlockSize)
   {
     int i, nIn = MaxNChannels(ERoute::kInput), nOut = MaxNChannels(ERoute::kOutput);
+
+    mBypassScratch.assign(static_cast<size_t>(nOut) * blockSize, 0.);
+    mBypassPointers.resize(nOut);
+    for (i = 0; i < nOut; ++i)
+      mBypassPointers[i] = mBypassScratch.data() + static_cast<size_t>(i) * blockSize;
 
     for (i = 0; i < nIn; ++i)
     {
